@@ -8,7 +8,8 @@ Based on: Bo Zhao, Nima Dehmamy, Robin Walters, Rose Yu.
 *Symmetry Teleportation for Accelerated Optimization*. NeurIPS 2022.
 
 > **Scope:** The current implementation focuses on diagonal scaling symmetry
-> for transformer FFN layers with ReLU or GELU activations. The model must
+> for transformer FFN layers with ReLU activation. The symmetry is
+> loss-invariant for ReLU; it does not hold exactly for GELU. The model must
 > implement `get_ffn_layers(layer_idx)` and return `(linear1, linear2)`.
 
 ## Minimal usage
@@ -43,14 +44,27 @@ stats = optimizer.teleport_stats()
 print(f"Accepted {stats['accepted_count']} / {stats['total_attempts']} attempts")
 ```
 
-## Example
+## Examples
+
+Synthetic regression (quick demo):
 
 ```bash
 python3 examples/tiny_transformer_example.py
 ```
 
-This runs a small CPU example showing how to plug TeleportSGD into a standard
-training loop.
+Character-level language modeling on a bundled public-domain text snippet
+(no external data required):
+
+```bash
+python3 examples/text_language_task_example.py          # full run
+python3 examples/text_language_task_example.py --smoke  # smoke test (~10s on CPU)
+```
+
+See [IMPLEMENTATION.md](IMPLEMENTATION.md) for details on the package design,
+symmetry type, objective/acceptance logic, and the text task.
+
+See [RESULTS.md](RESULTS.md) for paired multi-seed benchmark results on both
+text corpora.
 
 ## Benchmark script
 

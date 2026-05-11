@@ -26,6 +26,6 @@ Example:
 __version__ = '0.1.0'
 
 from .optim import TeleportSGD
-from .groups import ScalarRescalingGroup
+from .groups import ScalarRescalingGroup, AttentionQKGroup
 
-__all__ = ['TeleportSGD', 'ScalarRescalingGroup']
+__all__ = ['TeleportSGD', 'ScalarRescalingGroup', 'AttentionQKGroup']

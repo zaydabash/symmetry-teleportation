@@ -160,6 +160,10 @@ class CharLMTransformer(nn.Module):
         enc = self.encoder.layers[layer_idx]
         return enc.linear1, enc.linear2
 
+    def get_attn_layer(self, layer_idx: int = 0):
+        """Return the nn.MultiheadAttention module at layer_idx."""
+        return self.encoder.layers[layer_idx].self_attn
+
 
 # ---------------------------------------------------------------------------
 # Training loops

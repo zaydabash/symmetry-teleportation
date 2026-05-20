@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.optim import Optimizer
 import numpy as np
 
-from .teleport import teleport_ffn_diagonal
+from .teleport import teleport_ffn_diagonal, teleport_qk_diagonal, _apply_qk_diagonal_inplace
 from .groups import ScalarRescalingGroup
 
 
@@ -109,11 +109,18 @@ class TeleportSGD(Optimizer):
         self.debug_first_attempt = self.teleport_config.get('debug_first_attempt', False)
         self._debug_attempt_done = False
         self._next_step_lr_scale = None
-        
+
+        # Teleportation target: 'ffn' (default) or 'ffn_qk'
+        self.teleport_target = self.teleport_config.get('teleport_target', 'ffn')
+        if self.teleport_target not in ('ffn', 'ffn_qk'):
+            raise ValueError(
+                f"teleport_target must be 'ffn' or 'ffn_qk', got {self.teleport_target!r}"
+            )
+
         # Teleportation statistics
         self.teleport_attempts = []
         self.teleport_active_steps = []
-        
+
         # Validate teleportation config if enabled
         if self.teleport_every > 0:
             if self.model is None:
@@ -122,6 +129,10 @@ class TeleportSGD(Optimizer):
                 raise ValueError("teleport_config['X_teleport'] and 'Y_teleport' are required")
             if self.loss_fn is None:
                 raise ValueError("teleport_config['loss_fn'] is required")
+            if self.teleport_target == 'ffn_qk' and self.objective != 'virtual_sgd_improve':
+                raise ValueError(
+                    "teleport_target='ffn_qk' requires objective='virtual_sgd_improve'"
+                )
     
     def __setstate__(self, state):
         super(TeleportSGD, self).__setstate__(state)
@@ -187,7 +198,10 @@ class TeleportSGD(Optimizer):
         
         # Apply teleportation if scheduled (needs gradients enabled)
         if self.teleport_every > 0 and self.step_count % self.teleport_every == 0:
-            self._apply_teleportation()
+            if self.teleport_target == 'ffn_qk':
+                self._apply_teleportation_ffn_qk()
+            else:
+                self._apply_teleportation()
         
         return loss
     
@@ -370,6 +384,177 @@ class TeleportSGD(Optimizer):
         if not accepted:
             for name, p in self.model.named_parameters():
                 p.data.copy_(params_before[name])
+
+    def _compute_virtual_sgd_losses_ffn_qk(self, s_candidate, a_candidate, lr):
+        """Compare baseline vs. combined FFN+QK transformed model over K virtual SGD steps."""
+        k_virtual = 5
+        lr_virtual = 2.0 * lr
+
+        sd0 = self._clone_state_dict()
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            # BASELINE: k virtual SGD steps from current params
+            self._load_state_dict(sd0)
+            _, grads0 = self._compute_loss_and_grads()
+            norm_before = self._grad_norm_from_grads(grads0)
+            self._apply_virtual_sgd_step(grads0, lr_virtual)
+            for _ in range(k_virtual - 1):
+                _, grads_step = self._compute_loss_and_grads()
+                self._apply_virtual_sgd_step(grads_step, lr_virtual)
+            with torch.no_grad():
+                L_baseline_virtual = float(self.loss_fn(self.model(self.X_teleport), self.Y_teleport).item())
+
+            # TELEPORTED: apply FFN + QK transforms, then k virtual SGD steps
+            self._load_state_dict(sd0)
+            linear1, linear2 = self.model.get_ffn_layers(self.layer_idx)
+            ScalarRescalingGroup.apply_transform(linear1, linear2, s_candidate)
+            attn = self.model.get_attn_layer(self.layer_idx)
+            _apply_qk_diagonal_inplace(attn, a_candidate)
+            _, grads1 = self._compute_loss_and_grads()
+            norm_after = self._grad_norm_from_grads(grads1)
+            self._apply_virtual_sgd_step(grads1, lr_virtual)
+            for _ in range(k_virtual - 1):
+                _, grads_step = self._compute_loss_and_grads()
+                self._apply_virtual_sgd_step(grads_step, lr_virtual)
+            with torch.no_grad():
+                L_tp_virtual = float(self.loss_fn(self.model(self.X_teleport), self.Y_teleport).item())
+        finally:
+            self._load_state_dict(sd0)
+            if was_training:
+                self.model.train()
+            self.model.zero_grad(set_to_none=True)
+
+        self._last_virtual_grad_norm_before = norm_before
+        self._last_virtual_grad_norm_after = norm_after
+        return L_baseline_virtual, L_tp_virtual
+
+    def _apply_teleportation_ffn_qk(self):
+        """Apply combined FFN + Q/K diagonal teleportation step."""
+        if self.X_teleport is None or self.Y_teleport is None or self.loss_fn is None:
+            return
+
+        lr = self.param_groups[0]['lr']
+
+        params_before = {}
+        for name, p in self.model.named_parameters():
+            params_before[name] = p.detach().clone()
+
+        norm_before = self._flat_param_norm(self.model)
+
+        # Search FFN candidate (independent of QK; model not mutated during search)
+        s_best, J_ffn_before, J_ffn_best, diag_ffn = teleport_ffn_diagonal(
+            self.model,
+            self.layer_idx,
+            self.X_teleport,
+            self.loss_fn,
+            self.Y_teleport,
+            lr_theta=self.lr_theta,
+            steps=self.inner_steps,
+            log_s_clip=self.log_s_clip,
+            lr=lr,
+            lambda_penalty=self.lambda_penalty,
+            objective='virtual_sgd_improve',
+            s_param=self.s_param,
+        )
+
+        # Search QK candidate (independent; model not mutated during search)
+        a_best, J_qk_before, J_qk_best, diag_qk = teleport_qk_diagonal(
+            self.model,
+            self.layer_idx,
+            self.X_teleport,
+            self.loss_fn,
+            self.Y_teleport,
+            lr_theta=self.lr_theta,
+            steps=self.inner_steps,
+            log_a_clip=self.log_s_clip,
+            lr=lr,
+        )
+
+        # Evaluate combined state: accept only if combined improves virtual loss
+        L_baseline_virtual, L_tp_virtual = self._compute_virtual_sgd_losses_ffn_qk(
+            s_best, a_best, lr
+        )
+        delta_virtual = L_tp_virtual - L_baseline_virtual
+
+        log_s_best = torch.log(s_best.clamp_min(1e-12))
+        max_abs_log_s = float(log_s_best.abs().max().item())
+        log_a_best = torch.log(a_best.clamp_min(1e-12))
+        max_abs_log_a = float(log_a_best.abs().max().item())
+
+        log_s_hi = float(self.log_s_clip[1])
+        max_s_bound = math.exp(log_s_hi)
+        finite_ok = (
+            math.isfinite(L_baseline_virtual)
+            and math.isfinite(L_tp_virtual)
+            and math.isfinite(J_ffn_before)
+            and math.isfinite(J_qk_before)
+        )
+        bounds_ok = (float(s_best.max().item()) <= max_s_bound) and (max_abs_log_s <= log_s_hi)
+        epsilon = 1e-10
+        accepted = (L_tp_virtual < (L_baseline_virtual - epsilon)) and finite_ok and bounds_ok
+        nontrivial = (max_abs_log_s >= self.min_log_s_magnitude
+                      or max_abs_log_a >= self.min_log_s_magnitude)
+
+        # Apply both transforms if accepted; otherwise restore exact original params
+        if accepted:
+            linear1, linear2 = self.model.get_ffn_layers(self.layer_idx)
+            ScalarRescalingGroup.apply_transform(linear1, linear2, s_best)
+            attn = self.model.get_attn_layer(self.layer_idx)
+            _apply_qk_diagonal_inplace(attn, a_best)
+        else:
+            for name, p in self.model.named_parameters():
+                p.data.copy_(params_before[name])
+
+        max_w_delta = self._max_param_delta(self.model, params_before)
+        changed = max_w_delta >= 1e-6
+        teleport_active_strict = accepted and nontrivial and changed
+
+        norm_after = self._flat_param_norm(self.model)
+        max_inv_delta = self._check_invariance(params_before)
+
+        attempt_log = {
+            'step_count': self.step_count,
+            'step': self.step_count,
+            'accepted': accepted,
+            'nontrivial': nontrivial,
+            'changed': changed,
+            'active_strict': teleport_active_strict,
+            'finite_ok': finite_ok,
+            'bounds_ok': bounds_ok,
+            'objective': 'virtual_sgd_improve',
+            'teleport_target': 'ffn_qk',
+            'J_before_val': J_ffn_before,
+            'J_best_val': J_ffn_best,
+            'delta_J': J_ffn_best - J_ffn_before,
+            'J_qk_before_val': J_qk_before,
+            'J_qk_best_val': J_qk_best,
+            'delta_J_qk': J_qk_best - J_qk_before,
+            'L_baseline_virtual': L_baseline_virtual,
+            'L_tp_virtual': L_tp_virtual,
+            'delta_virtual': delta_virtual,
+            'grad_norm_virtual_before': getattr(self, '_last_virtual_grad_norm_before', None),
+            'grad_norm_virtual_after': getattr(self, '_last_virtual_grad_norm_after', None),
+            'max_abs_log_s': max_abs_log_s,
+            'mean_abs_log_s': float(log_s_best.abs().mean().item()),
+            'max_abs_log_a': max_abs_log_a,
+            'mean_abs_log_a': float(log_a_best.abs().mean().item()),
+            's_min': float(s_best.min().item()),
+            's_max': float(s_best.max().item()),
+            'a_min': diag_qk.get('a_min', float(a_best.min().item())),
+            'a_max': diag_qk.get('a_max', float(a_best.max().item())),
+            'max_w_delta': max_w_delta,
+            'norm_before': norm_before,
+            'norm_after': norm_after,
+            'max_inv_delta': max_inv_delta,
+            'loss_before': diag_ffn.get('loss_before', 0.0),
+            'loss_after_ffn': diag_ffn.get('loss_after', 0.0),
+            'loss_after_qk': diag_qk.get('loss_after', 0.0),
+        }
+
+        self.teleport_attempts.append(attempt_log)
+        if teleport_active_strict:
+            self.teleport_active_steps.append(self.step_count)
 
     def _clone_state_dict(self):
         """Clone model state_dict tensors."""

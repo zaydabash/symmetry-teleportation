@@ -11,6 +11,17 @@ import torch.nn.functional as F
 from torch.func import functional_call
 from collections import OrderedDict
 import contextlib
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+
+def _math_sdpa():
+    """Context manager that forces the math SDPA kernel.
+
+    Used inside teleport_qk_diagonal: when in_proj_weight is built with
+    requires_grad=True (through sym_param), flash-attention-for-cpu cannot
+    propagate create_graph=True gradients.  The math kernel handles it fine.
+    """
+    return sdpa_kernel(SDPBackend.MATH)
 
 
 def sym_param_to_s_vec(sym_param, s_param='exp', log_s_clip=(-2.0, 2.0), s_eps=1e-8):
@@ -622,13 +633,242 @@ def teleport_ffn_diagonal(model, layer_idx, X_full, loss_fn, Y,
         }
         
         return s_best, J_before_val, best_J, diagnostics
-        
+
     finally:
         # Restore RNG state
         torch.set_rng_state(cpu_rng_start)
         if cuda_rng_start is not None:
             torch.cuda.set_rng_state_all(cuda_rng_start)
-        
+
         # Restore training mode
+        if was_training:
+            model.train()
+
+
+# ---------------------------------------------------------------------------
+# Q/K diagonal teleportation
+# ---------------------------------------------------------------------------
+
+def _apply_qk_diagonal_inplace(attn, a: torch.Tensor) -> None:
+    """
+    Apply diagonal Q/K scaling in-place to nn.MultiheadAttention.
+
+    For diagonal a > 0 (shape d = nhead * d_h):
+        W_Q' rows i  *= a[i]      (rows 0:d of in_proj_weight)
+        W_K' rows i  *= 1/a[i]   (rows d:2*d of in_proj_weight)
+        b_Q' *= a,  b_K' *= 1/a  (if bias present)
+
+    Preserves Q_h K_h^T for each head h (exact in arithmetic).
+    Uses element-wise ops — no matrix inversion needed.
+    """
+    d = attn.embed_dim
+    a = a.to(device=attn.in_proj_weight.device, dtype=attn.in_proj_weight.dtype)
+    a_inv = 1.0 / a
+    with torch.no_grad():
+        W = attn.in_proj_weight
+        W[0:d, :].copy_(W[0:d, :].clone() * a[:, None])
+        W[d:2 * d, :].copy_(W[d:2 * d, :].clone() * a_inv[:, None])
+        if attn.in_proj_bias is not None:
+            b = attn.in_proj_bias
+            b[0:d].copy_(b[0:d].clone() * a)
+            b[d:2 * d].copy_(b[d:2 * d].clone() * a_inv)
+
+
+def teleport_qk_diagonal(
+    model,
+    layer_idx,
+    X_full,
+    loss_fn,
+    Y,
+    lr_theta=1e-2,
+    steps=20,
+    log_a_clip=(-2.0, 2.0),
+    lr=0.01,
+    restarts=10,
+):
+    """
+    Teleport Q/K projections using diagonal per-head scaling.
+
+    For a > 0 (shape d = nhead * d_h), the transform is:
+        W_Q rows i  *= a[i]     (Q projection scaled up)
+        W_K rows i  *= 1/a[i]  (K projection scaled down)
+        b_Q *= a,  b_K *= 1/a  (if bias present)
+
+    This preserves Q_h K_h^T for each head h up to floating-point rounding.
+
+    Requires model.get_attn_layer(layer_idx) returning nn.MultiheadAttention.
+
+    Uses virtual_sgd_improve objective (K=5 virtual SGD steps) to find
+    the scaling that most improves the post-step loss.
+
+    Args:
+        model: Model with get_attn_layer(layer_idx) method
+        layer_idx: Encoder layer index
+        X_full: Input batch
+        loss_fn: Loss function
+        Y: Target batch
+        lr_theta: Learning rate for log_a gradient descent
+        steps: Inner optimization steps per restart
+        log_a_clip: Clamp range for log_a (same semantics as log_s_clip for FFN)
+        lr: SGD step size used in the virtual-step objective
+        restarts: Number of random restarts
+
+    Returns:
+        a_best: Best diagonal scales (shape d), all positive, detached
+        J_before_val: Objective at identity (a = 1)
+        J_best_val: Best objective value found
+        diagnostics: Dict with log_a statistics and loss info
+    """
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+
+    was_training = model.training
+    model.eval()
+
+    cpu_rng_start = torch.get_rng_state()
+    cuda_rng_start = None
+    if torch.cuda.is_available():
+        cuda_rng_start = torch.cuda.get_rng_state_all()
+
+    try:
+        attn = model.get_attn_layer(layer_idx)
+        if attn.in_proj_weight is None:
+            raise ValueError(
+                "teleport_qk_diagonal requires in_proj_weight "
+                "(qkv_same_embed_dim=True)."
+            )
+        d = attn.embed_dim  # nhead * d_h
+
+        # Find parameter names via identity map
+        id_to_name = {id(p): name for name, p in model.named_parameters()}
+        proj_weight_name = id_to_name.get(id(attn.in_proj_weight))
+        if proj_weight_name is None:
+            raise ValueError(
+                f"teleport_qk_diagonal: layer_idx={layer_idx} "
+                "missing key for in_proj_weight"
+            )
+        proj_bias_name = None
+        if attn.in_proj_bias is not None:
+            proj_bias_name = id_to_name.get(id(attn.in_proj_bias))
+            if proj_bias_name is None:
+                raise ValueError(
+                    f"teleport_qk_diagonal: layer_idx={layer_idx} "
+                    "missing key for in_proj_bias"
+                )
+
+        # Detached snapshot of all parameters for functional_call
+        params_dict = {k: v.detach().clone() for k, v in model.named_parameters()}
+
+        # Measure loss at identity before any transform
+        with torch.no_grad():
+            out_before = functional_call(model, params_dict, (X_full,))
+            loss_before = float(loss_fn(out_before, Y).item())
+
+        def _build_qk_params(sym_param):
+            """Build transformed param dict given log_a = sym_param (has grad)."""
+            a = sym_param_to_s_vec(sym_param, 'exp', log_a_clip)  # shape (d,)
+            a_inv = 1.0 / a
+
+            params_t = {k: v.clone() for k, v in params_dict.items()}
+            W = params_dict[proj_weight_name]   # (3*d, d_model), detached
+            W_Q = W[0:d, :]
+            W_K = W[d:2 * d, :]
+            W_V = W[2 * d:, :]
+            # W_Q * a and W_K * a_inv have grad_fn because a depends on sym_param
+            params_t[proj_weight_name] = torch.cat([
+                W_Q * a[:, None],
+                W_K * a_inv[:, None],
+                W_V,
+            ], dim=0)
+
+            if proj_bias_name is not None:
+                b = params_dict[proj_bias_name]  # (3*d,), detached
+                params_t[proj_bias_name] = torch.cat([
+                    b[0:d] * a,
+                    b[d:2 * d] * a_inv,
+                    b[2 * d:],
+                ], dim=0)
+
+            return params_t, a
+
+        # J at identity (sym_param = 0 → a = 1 everywhere)
+        # Force math SDPA kernel: in_proj_weight has requires_grad=True (via
+        # sym_param), so flash-attention-for-cpu cannot handle create_graph=True.
+        with _math_sdpa():
+            sym_param_zero = torch.zeros(d, device=device, dtype=dtype, requires_grad=True)
+            params_t_zero, _ = _build_qk_params(sym_param_zero)
+            J_before_obj = objective_virtual_sgd_improve(
+                model, OrderedDict(params_t_zero), sym_param_zero,
+                X_full, Y, loss_fn, lr, virtual_steps=5, lr_virtual_mult=2.0,
+            )
+            J_before_val = float(J_before_obj.detach().item())
+
+            best_sym_param = None
+            best_J = None
+
+            for _ in range(restarts):
+                with torch.no_grad():
+                    init = 5e-2 * torch.randn(d, device=device, dtype=dtype)
+                sym_param = init.detach().clone().requires_grad_(True)
+
+                for _ in range(steps):
+                    params_t, _ = _build_qk_params(sym_param)
+                    J = objective_virtual_sgd_improve(
+                        model, OrderedDict(params_t), sym_param,
+                        X_full, Y, loss_fn, lr, virtual_steps=5, lr_virtual_mult=2.0,
+                    )
+                    J_val = float(J.detach().item())
+                    if best_J is None or J_val < best_J:
+                        best_J = J_val
+                        best_sym_param = sym_param.detach().clone()
+
+                    dJ = torch.autograd.grad(J, sym_param, retain_graph=False)[0]
+                    with torch.no_grad():
+                        sym_param = (sym_param - lr_theta * dJ)
+                    sym_param = sym_param.detach().requires_grad_(True)
+
+        if best_sym_param is None:
+            best_sym_param = torch.zeros(d, device=device, dtype=dtype)
+
+        a_best = sym_param_to_s_vec(best_sym_param, 'exp', log_a_clip).detach()
+
+        # Measure loss at best transform (stateless)
+        with torch.no_grad():
+            a_inv_best = 1.0 / a_best
+            W = params_dict[proj_weight_name]
+            params_after = {k: v.clone() for k, v in params_dict.items()}
+            params_after[proj_weight_name] = torch.cat([
+                W[0:d, :] * a_best[:, None],
+                W[d:2 * d, :] * a_inv_best[:, None],
+                W[2 * d:, :],
+            ], dim=0)
+            if proj_bias_name is not None:
+                b = params_dict[proj_bias_name]
+                params_after[proj_bias_name] = torch.cat([
+                    b[0:d] * a_best,
+                    b[d:2 * d] * a_inv_best,
+                    b[2 * d:],
+                ], dim=0)
+            out_after = functional_call(model, params_after, (X_full,))
+            loss_after = float(loss_fn(out_after, Y).item())
+
+        log_a_best = torch.log(a_best.clamp_min(1e-12))
+        diagnostics = {
+            'max_abs_log_a': float(log_a_best.abs().max().item()),
+            'mean_abs_log_a': float(log_a_best.abs().mean().item()),
+            'a_min': float(a_best.min().item()),
+            'a_max': float(a_best.max().item()),
+            'max_abs_a_minus_one': float((a_best - 1.0).abs().max().item()),
+            'loss_before': loss_before,
+            'loss_after': loss_after,
+            'delta_loss': loss_after - loss_before,
+        }
+
+        return a_best, J_before_val, best_J if best_J is not None else J_before_val, diagnostics
+
+    finally:
+        torch.set_rng_state(cpu_rng_start)
+        if cuda_rng_start is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_start)
         if was_training:
             model.train()

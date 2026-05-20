@@ -9,20 +9,24 @@ theory, objective/acceptance logic, and the included language modeling task.
 
 ```
 symmetry_teleport/
-    __init__.py      exports TeleportSGD, ScalarRescalingGroup
+    __init__.py      exports TeleportSGD, ScalarRescalingGroup, AttentionQKGroup
     optim.py         TeleportSGD: SGD + periodic teleport scheduling
-    teleport.py      teleport_ffn_diagonal: inner search via functional_call
-    groups.py        ScalarRescalingGroup: in-place parameter transform
+    teleport.py      teleport_ffn_diagonal, teleport_qk_diagonal, helpers
+    groups.py        ScalarRescalingGroup, AttentionQKGroup: in-place transforms
     utils.py         shared helpers (seeds, tensor hashing)
 examples/
     tiny_transformer_example.py    synthetic regression demo
     text_language_task_example.py  char-level language modeling demo
+    attention_qk_demo.py           Q/K symmetry invariance demo
 scripts/
-    bench_tiny_transformer.py      paired multi-seed benchmark
+    bench_tiny_transformer.py      paired multi-seed FFN benchmark
+    bench_ffn_qk_compare.py        3-condition FFN vs FFN+QK benchmark
 tests/
     test_optimizer_basic.py
     test_group_scalar.py
     test_new_features.py
+    test_attention_qk.py
+    test_teleport_qk.py
 ```
 
 The package has no runtime dependencies beyond `torch` and `numpy`.
@@ -31,15 +35,17 @@ The package has no runtime dependencies beyond `torch` and `numpy`.
 
 ## 2. Training integration
 
-`TeleportSGD` is a drop-in replacement for `torch.optim.SGD`. The only
-additional requirement is that the model implements:
+`TeleportSGD` is a drop-in replacement for `torch.optim.SGD`. The model must
+implement `get_ffn_layers(layer_idx)` for FFN-only teleportation.  For
+`teleport_target='ffn_qk'` it must also implement `get_attn_layer(layer_idx)`:
 
 ```python
 def get_ffn_layers(self, layer_idx: int) -> tuple[nn.Linear, nn.Linear]:
     ...
-```
 
-returning `(linear1, linear2)` of the FFN block to be teleported.
+def get_attn_layer(self, layer_idx: int) -> nn.MultiheadAttention:
+    ...
+```
 
 Minimal wiring:
 
@@ -195,21 +201,61 @@ teleport config.
 
 ---
 
-## 7. Limitations
+## 7. Q/K attention diagonal scaling symmetry
 
-- **Symmetry scope:** Only diagonal FFN scaling symmetry is implemented.
-  Attention weights, layer norms, and embedding layers are not teleported.
-- **Single layer:** Only one FFN layer is teleported per step
-  (`layer_idx` is fixed). Multi-layer teleportation is not implemented.
-- **No wall-clock guarantees:** Teleportation adds inner optimization
-  overhead proportional to `inner_steps × virtual_steps × batch_size`.
-  Reported results are in SGD-step space (AUC, steps-to-threshold), not
-  wall-clock time.
-- **Activation requirement:** The diagonal scaling symmetry is exactly loss-
-  invariant only for ReLU (`ReLU(s·z) = s·ReLU(z)` for `s > 0`). GELU is
-  not positively homogeneous — `GELU(s·z) ≠ s·GELU(z)` in general — so the
-  network output is not preserved under the transform and the invariance does
-  not hold.
+For `teleport_target='ffn_qk'`, an additional diagonal per-head scaling is
+applied to the Q and K projections alongside the FFN scaling.
+
+**Why diagonal:** The full Q/K symmetry group is GL(d), i.e. any invertible
+matrix A such that Q' K'^T = (QA)(KA^{-T})^T = QK^T. A dense A requires
+matrix inversion (unstable for large cond(A)) and O(d²) parameters. The
+diagonal restriction A = diag(a) keeps the search in O(d) parameters, avoids
+inversion (a_inv = 1/a element-wise), and mirrors the FFN diagonal symmetry.
+For multi-head attention the diagonal must be block-diagonal (one d_h × d_h
+block per head); a flat per-element diagonal is the natural restriction.
+
+**Weight-space transform** (no matrix inverse; operations are element-wise):
+
+```
+W_Q rows i  ×= a[i]      W_K rows i  /= a[i]
+b_Q         ×= a          b_K         /= a
+W_V, b_V    unchanged
+```
+
+**Why the full output is unchanged:** Softmax(QK^T / √d) is invariant to
+diagonal scaling since Q'K'^T = QK^T. The value output V is not scaled.
+Therefore the full attention output — and the entire model output — is
+preserved. This is a **stronger symmetry** than the FFN case, where the
+output is preserved at the current input but the gradient geometry changes.
+
+**Parameterization:** `a = exp(log_a)`, `log_a ∈ ℝ^d` initialized near zero.
+The inner search uses the same `virtual_sgd_improve` objective as the FFN.
+Flash attention on CPU does not support `create_graph=True` when
+`in_proj_weight` has `requires_grad=True`; `teleport_qk_diagonal` therefore
+wraps its optimization loop with `sdpa_kernel(SDPBackend.MATH)`.
+
+**Acceptance:** The combined FFN+QK transform is evaluated jointly via
+`_compute_virtual_sgd_losses_ffn_qk`. Both transforms are accepted or rejected
+together; a rejection restores exact original parameters.
+
+**Limitation:** Requires `nn.MultiheadAttention` with packed `in_proj_weight`
+(`kdim == vdim == embed_dim`). Cross-attention (separate `Q`, `K`, `V`
+weight matrices) is not currently supported.
+
+---
+
+## 8. Limitations
+
+- **Single layer:** Only one layer is teleported per step (`layer_idx` is
+  fixed). Multi-layer teleportation is not implemented.
+- **No wall-clock guarantees:** Teleportation adds inner optimization overhead
+  proportional to `inner_steps × virtual_steps × batch_size`. Reported
+  results are in SGD-step space (AUC, steps-to-threshold), not wall-clock
+  time. FFN+QK is roughly 2× slower per teleport attempt than FFN-only.
+- **Activation requirement:** The FFN diagonal scaling symmetry is exactly
+  loss-invariant only for ReLU. GELU is not positively homogeneous.
 - **Reference batch:** `X_teleport` / `Y_teleport` are fixed at optimizer
-  construction. Using a stale reference batch that no longer reflects the
-  current data distribution may reduce teleportation quality.
+  construction. Using a stale reference batch may reduce teleportation quality.
+- **Q/K scope:** The diagonal restriction on A is conservative. Dense GL(d)
+  transforms would explore a larger symmetry group but require stable matrix
+  inversion.

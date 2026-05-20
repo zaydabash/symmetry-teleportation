@@ -88,7 +88,7 @@ class TinyTransformer(nn.Module):
         """
         Extract FFN (feedforward) layers from specified encoder layer.
         Returns: (linear1, linear2) modules for teleportation.
-        
+
         Structure of TransformerEncoderLayer:
         - .linear1: First Linear layer (d_model -> dim_feedforward)
         - .linear2: Second Linear layer (dim_feedforward -> d_model)
@@ -97,6 +97,10 @@ class TinyTransformer(nn.Module):
         linear1 = encoder_layer.linear1
         linear2 = encoder_layer.linear2
         return linear1, linear2
+
+    def get_attn_layer(self, layer_idx=0):
+        """Return the nn.MultiheadAttention module at layer_idx."""
+        return self.encoder.layers[layer_idx].self_attn
 
 
 # ============================================================================
